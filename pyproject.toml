@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sam-3d-body"
+version = "0.1.0"
+description = "SAM 3D Body: Robust Full-Body Human Mesh Recovery with Apple Silicon MPS and CPU support"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "torch>=2.0",
+  "torchvision>=0.15",
+  "numpy>=1.24",
+  "opencv-python-headless>=4.8",
+  "einops>=0.6",
+  "timm>=0.9",
+  "roma>=1.4",
+  "yacs>=0.1.8",
+  "omegaconf>=2.3",
+  "pytorch-lightning>=2.0",
+  "huggingface-hub>=0.20",
+  "braceexpand>=0.1.7",
+  "trimesh>=4.0",
+  "pyrender>=0.1.45",
+]
+
+[tool.setuptools.packages.find]
+include = ["sam_3d_body*"]
+
+[tool.setuptools.package-data]
+"sam_3d_body" = ["**/*.yaml", "**/*.json", "**/*.txt"]
