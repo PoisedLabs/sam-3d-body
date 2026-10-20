@@ -12,13 +12,25 @@ class Dinov3Backbone(nn.Module):
         self.name = name
         self.cfg = cfg
 
-        self.encoder = torch.hub.load(
-            "facebookresearch/dinov3",
-            self.name,
-            source="github",
-            pretrained=False,
-            drop_path=self.cfg.MODEL.BACKBONE.DROP_PATH_RATE,
-        )
+        import os
+
+        local_repo = os.environ.get("DINOV3_REPO_DIR", "")
+        if local_repo and os.path.isdir(local_repo):
+            self.encoder = torch.hub.load(
+                local_repo,
+                self.name,
+                source="local",
+                pretrained=False,
+                drop_path=self.cfg.MODEL.BACKBONE.DROP_PATH_RATE,
+            )
+        else:
+            self.encoder = torch.hub.load(
+                "facebookresearch/dinov3",
+                self.name,
+                source="github",
+                pretrained=False,
+                drop_path=self.cfg.MODEL.BACKBONE.DROP_PATH_RATE,
+            )
         self.patch_size = self.encoder.patch_size
         self.embed_dim = self.embed_dims = self.encoder.embed_dim
 

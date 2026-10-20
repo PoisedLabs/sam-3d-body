@@ -7,8 +7,18 @@ from .utils.config import get_config
 from .utils.checkpoint import load_state_dict
 
 
-def load_sam_3d_body(checkpoint_path: str = "", device: str = "cuda", mhr_path: str = ""):
-    print("Loading SAM 3D Body model...")
+def _default_device() -> str:
+    if torch.cuda.is_available():
+        return "cuda"
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+def load_sam_3d_body(checkpoint_path: str = "", device: str | torch.device | None = None, mhr_path: str = ""):
+    if device is None or (str(device).startswith("cuda") and not torch.cuda.is_available()):
+        device = _default_device()
+    print(f"Loading SAM 3D Body model on {device}...")
     
     # Check the current directory, and if not present check the parent dir.
     model_cfg = os.path.join(os.path.dirname(checkpoint_path), "model_config.yaml")
@@ -48,4 +58,4 @@ def _hf_download(repo_id):
 
 def load_sam_3d_body_hf(repo_id, **kwargs):
     ckpt_path, mhr_path = _hf_download(repo_id)
-    return load_sam_3d_body(checkpoint_path=ckpt_path, mhr_path=mhr_path)
+    return load_sam_3d_body(checkpoint_path=ckpt_path, mhr_path=mhr_path, **kwargs)

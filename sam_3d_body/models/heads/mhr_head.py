@@ -224,9 +224,22 @@ class MHRHead(nn.Module):
             # Zero out non-hand parameters
             model_params[:, self.nonhand_param_idxs] = 0
 
-        curr_skinned_verts, curr_skel_state = self.mhr(
-            shape_params, model_params, expr_params
-        )
+        if shape_params.device.type == "mps":
+            # TorchScript MHR skeleton state propagation uses float64 (.double()) internally,
+            # which is unsupported on Apple Silicon MPS. Run the lightweight MHR FK step on CPU
+            # while keeping the ViT backbone and Transformer decoder on MPS.
+            self.mhr.to("cpu")
+            curr_skinned_verts, curr_skel_state = self.mhr(
+                shape_params.cpu(),
+                model_params.cpu(),
+                expr_params.cpu() if expr_params is not None else None,
+            )
+            curr_skinned_verts = curr_skinned_verts.to(shape_params.device)
+            curr_skel_state = curr_skel_state.to(shape_params.device)
+        else:
+            curr_skinned_verts, curr_skel_state = self.mhr(
+                shape_params, model_params, expr_params
+            )
         curr_joint_coords, curr_joint_quats, _ = torch.split(
             curr_skel_state, [3, 4, 1], dim=2
         )
