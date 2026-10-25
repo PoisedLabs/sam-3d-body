@@ -46,6 +46,7 @@ def _skel_multiply(state1: torch.Tensor, state2: torch.Tensor) -> torch.Tensor:
 
 from ..modules import rot6d_to_rotmat
 from ..modules.mhr_utils import (
+    batchXYZfrom6D,
     compact_cont_to_model_params_body,
     compact_cont_to_model_params_hand,
     compact_model_params_to_cont_body,
@@ -157,6 +158,14 @@ class MHRHead(nn.Module):
 
         self._fast_mhr_cache = None
         self._faces_numpy = None
+        self._body_keep_mask = None
+
+    def _get_body_keep_mask(self, device: torch.device) -> torch.Tensor:
+        if self._body_keep_mask is None or self._body_keep_mask.device != device:
+            mask = (~mhr_param_hand_mask).float()
+            mask[-3:] = 0.0
+            self._body_keep_mask = mask.to(device).unsqueeze(0)
+        return self._body_keep_mask
 
     def _get_faces_numpy(self):
         if self._faces_numpy is None:
@@ -348,28 +357,18 @@ class MHRHead(nn.Module):
         assert full_pose_params.shape[1] == 136
 
         # This drops in the hand poses from hand_pose_params (PCA 6D) into full_pose_params.
-        # Split into left and right hands
-        left_hand_params, right_hand_params = torch.split(
-            hand_pose_params,
-            [self.num_hand_pose_comps, self.num_hand_pose_comps],
-            dim=1,
-        )
-
-        # Change from cont to model params
-        left_hand_params_model_params = compact_cont_to_model_params_hand(
+        both_hands_cont = (
             self.hand_pose_mean
-            + torch.einsum("da,ab->db", left_hand_params, self.hand_pose_comps)
+            + hand_pose_params.unflatten(1, (2, self.num_hand_pose_comps))
+            @ self.hand_pose_comps
         )
-        right_hand_params_model_params = compact_cont_to_model_params_hand(
-            self.hand_pose_mean
-            + torch.einsum("da,ab->db", right_hand_params, self.hand_pose_comps)
-        )
+        both_hands_model_params = compact_cont_to_model_params_hand(both_hands_cont)
 
         # Drop it in
-        full_pose_params[:, self.hand_joint_idxs_left] = left_hand_params_model_params
-        full_pose_params[:, self.hand_joint_idxs_right] = right_hand_params_model_params
+        full_pose_params[:, self.hand_joint_idxs_left] = both_hands_model_params[:, 0]
+        full_pose_params[:, self.hand_joint_idxs_right] = both_hands_model_params[:, 1]
 
-        return full_pose_params  # B x 207
+        return full_pose_params  # B x 136
 
     def mhr_forward(
         self,
@@ -501,14 +500,7 @@ class MHRHead(nn.Module):
                     model_vert_joints = torch.cat(
                         [curr_skinned_verts, curr_joint_coords], dim=1
                     )  # B x (num_verts + 127) x 3
-                    model_keypoints_pred = (
-                        (
-                            self.keypoint_mapping
-                            @ model_vert_joints.permute(1, 0, 2).flatten(1, 2)
-                        )
-                        .reshape(-1, model_vert_joints.shape[0], 3)
-                        .permute(1, 0, 2)
-                    )
+                    model_keypoints_pred = self.keypoint_mapping @ model_vert_joints
 
                 if self.enable_hand_model:
                     # Zero out everything except for the right hand
@@ -553,20 +545,17 @@ class MHRHead(nn.Module):
             ### Global rotation is first 6.
             count = 6
             global_rot_6d = pred[:, :count]
-            global_rot_rotmat = rot6d_to_rotmat(global_rot_6d)  # B x 3 x 3
-            global_rot_euler = roma.rotmat_to_euler("ZYX", global_rot_rotmat)  # B x 3
+            global_rot_euler = batchXYZfrom6D(global_rot_6d).flip(-1)  # B x 3
             global_trans = torch.zeros_like(global_rot_euler)
 
             ## Next, get body pose.
             ### Hold onto raw, continuous version for iterative correction.
             pred_pose_cont = pred[:, count : count + self.body_cont_dim]
             count += self.body_cont_dim
-            ### Convert to eulers (and trans)
-            pred_pose_euler = compact_cont_to_model_params_body(pred_pose_cont)
-            ### Zero-out hands
-            pred_pose_euler[:, mhr_param_hand_mask] = 0
-            ### Zero-out jaw
-            pred_pose_euler[:, -3:] = 0
+            ### Convert to eulers (and trans), zeroing hands and jaw without boolean mask syncs
+            pred_pose_euler = compact_cont_to_model_params_body(
+                pred_pose_cont
+            ) * self._get_body_keep_mask(pred_pose_cont.device)
 
             ## Get remaining parameters
             pred_shape = pred[:, count : count + self.num_shape_comps]

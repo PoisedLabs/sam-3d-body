@@ -144,10 +144,14 @@ def batchXYZfrom6D(poses):
     ys = torch.atan2(-matrix[..., 2, 0], sy)
     zs = matrix[..., 1, 0] * 0
 
-    out_euler = torch.zeros_like(matrix[..., 0])
-    out_euler[..., 0] = x * (1 - singular) + xs * singular
-    out_euler[..., 1] = y * (1 - singular) + ys * singular
-    out_euler[..., 2] = z * (1 - singular) + zs * singular
+    out_euler = torch.stack(
+        [
+            x * (1 - singular) + xs * singular,
+            y * (1 - singular) + ys * singular,
+            z * (1 - singular) + zs * singular,
+        ],
+        dim=-1,
+    )
 
     return out_euler
 
@@ -162,34 +166,52 @@ def resize_image(image_array, scale_factor, interpolation=cv2.INTER_LINEAR):
     return resized_image
 
 
+_HAND_IDX_CACHE = {}
+_BODY_IDX_CACHE = {}
+
+
+def _get_hand_idx_cache(device: torch.device):
+    cached = _HAND_IDX_CACHE.get(device)
+    if cached is not None:
+        return cached
+    hand_dofs_in_order = [3, 1, 1, 3, 1, 1, 3, 1, 1, 3, 1, 1, 2, 3, 1, 1]
+    mask_cont_threedofs = torch.cat(
+        [torch.ones(2 * k, dtype=torch.bool) * (k == 3) for k in hand_dofs_in_order]
+    )
+    mask_cont_onedofs = torch.cat(
+        [torch.ones(2 * k, dtype=torch.bool) * (k in (1, 2)) for k in hand_dofs_in_order]
+    )
+    mask_model_params_threedofs = torch.cat(
+        [torch.ones(k, dtype=torch.bool) * (k == 3) for k in hand_dofs_in_order]
+    )
+    mask_model_params_onedofs = torch.cat(
+        [torch.ones(k, dtype=torch.bool) * (k in (1, 2)) for k in hand_dofs_in_order]
+    )
+    cont_3dof_idx = torch.nonzero(mask_cont_threedofs, as_tuple=False).squeeze(1).to(device)
+    cont_1dof_idx = torch.nonzero(mask_cont_onedofs, as_tuple=False).squeeze(1).to(device)
+    param_perm = torch.cat(
+        [
+            torch.nonzero(mask_model_params_threedofs, as_tuple=False).squeeze(1),
+            torch.nonzero(mask_model_params_onedofs, as_tuple=False).squeeze(1),
+        ]
+    )
+    param_inv_perm = torch.argsort(param_perm).to(device)
+    cached = (cont_3dof_idx, cont_1dof_idx, param_inv_perm)
+    _HAND_IDX_CACHE[device] = cached
+    return cached
+
+
 def compact_cont_to_model_params_hand(hand_cont):
     # These are ordered by joint, not model params ^^
     assert hand_cont.shape[-1] == 54
-    hand_dofs_in_order = torch.tensor([3, 1, 1, 3, 1, 1, 3, 1, 1, 3, 1, 1, 2, 3, 1, 1])
-    assert sum(hand_dofs_in_order) == 27
-    # Mask of 3DoFs into hand_cont
-    mask_cont_threedofs = torch.cat(
-        [torch.ones(2 * k).bool() * (k in [3]) for k in hand_dofs_in_order]
-    )
-    # Mask of 1DoFs (including 2DoF) into hand_cont
-    mask_cont_onedofs = torch.cat(
-        [torch.ones(2 * k).bool() * (k in [1, 2]) for k in hand_dofs_in_order]
-    )
-    # Mask of 3DoFs into hand_model_params
-    mask_model_params_threedofs = torch.cat(
-        [torch.ones(k).bool() * (k in [3]) for k in hand_dofs_in_order]
-    )
-    # Mask of 1DoFs (including 2DoF) into hand_model_params
-    mask_model_params_onedofs = torch.cat(
-        [torch.ones(k).bool() * (k in [1, 2]) for k in hand_dofs_in_order]
-    )
+    cont_3dof_idx, cont_1dof_idx, param_inv_perm = _get_hand_idx_cache(hand_cont.device)
 
     # Convert hand_cont to eulers
     ## First for 3DoFs
-    hand_cont_threedofs = hand_cont[..., mask_cont_threedofs].unflatten(-1, (-1, 6))
+    hand_cont_threedofs = hand_cont.index_select(-1, cont_3dof_idx).unflatten(-1, (-1, 6))
     hand_model_params_threedofs = batchXYZfrom6D(hand_cont_threedofs).flatten(-2, -1)
     ## Next for 1DoFs
-    hand_cont_onedofs = hand_cont[..., mask_cont_onedofs].unflatten(
+    hand_cont_onedofs = hand_cont.index_select(-1, cont_1dof_idx).unflatten(
         -1, (-1, 2)
     )  # (sincos)
     hand_model_params_onedofs = torch.atan2(
@@ -197,11 +219,9 @@ def compact_cont_to_model_params_hand(hand_cont):
     )
 
     # Finally, assemble into a 27-dim vector, ordered by joint, then XYZ.
-    hand_model_params = torch.zeros(*hand_cont.shape[:-1], 27).to(hand_cont)
-    hand_model_params[..., mask_model_params_threedofs] = hand_model_params_threedofs
-    hand_model_params[..., mask_model_params_onedofs] = hand_model_params_onedofs
-
-    return hand_model_params
+    return torch.cat(
+        [hand_model_params_threedofs, hand_model_params_onedofs], dim=-1
+    ).index_select(-1, param_inv_perm)
 
 
 def compact_model_params_to_cont_hand(hand_model_params):
@@ -318,18 +338,32 @@ def compact_cont_to_rotmat_body(body_pose_cont, inflate_trans=False):
     return body_rotmat_params
 
 
-def compact_cont_to_model_params_body(body_pose_cont):
+def _get_body_idx_cache(device: torch.device):
+    cached = _BODY_IDX_CACHE.get(device)
+    if cached is not None:
+        return cached
     # fmt: off
-    all_param_3dof_rot_idxs = torch.LongTensor([(0, 2, 4), (6, 8, 10), (12, 13, 14), (15, 16, 17), (18, 19, 20), (21, 22, 23), (24, 25, 26), (27, 28, 29), (34, 35, 36), (37, 38, 39), (44, 45, 46), (53, 54, 55), (64, 65, 66), (85, 69, 73), (86, 70, 79), (87, 71, 82), (88, 72, 76), (91, 92, 93), (112, 96, 100), (113, 97, 106), (114, 98, 109), (115, 99, 103), (130, 131, 132)])
+    all_param_3dof_rot_idxs = torch.LongTensor([(0, 2, 4), (6, 8, 10), (12, 13, 14), (15, 16, 17), (18, 19, 20), (21, 22, 23), (24, 25, 26), (27, 28, 29), (34, 35, 36), (37, 38, 39), (44, 45, 46), (53, 54, 55), (64, 65, 66), (85, 69, 73), (86, 70, 79), (87, 71, 82), (88, 72, 76), (91, 92, 93), (112, 96, 100), (113, 97, 106), (114, 98, 109), (115, 99, 103), (130, 131, 132)]).flatten()
     all_param_1dof_rot_idxs = torch.LongTensor([1, 3, 5, 7, 9, 11, 30, 31, 32, 33, 40, 41, 42, 43, 47, 48, 49, 50, 51, 52, 56, 57, 58, 59, 60, 61, 62, 63, 67, 68, 74, 75, 77, 78, 80, 81, 83, 84, 89, 90, 94, 95, 101, 102, 104, 105, 107, 108, 110, 111, 116, 117, 118, 119, 120, 121, 122, 123])
     all_param_1dof_trans_idxs = torch.LongTensor([124, 125, 126, 127, 128, 129])
     # fmt: on
-    num_3dof_angles = len(all_param_3dof_rot_idxs) * 3
-    num_1dof_angles = len(all_param_1dof_rot_idxs)
-    num_1dof_trans = len(all_param_1dof_trans_idxs)
+    body_perm = torch.cat(
+        [all_param_3dof_rot_idxs, all_param_1dof_rot_idxs, all_param_1dof_trans_idxs]
+    )
+    body_inv_perm = torch.argsort(body_perm).to(device)
+    cached = body_inv_perm
+    _BODY_IDX_CACHE[device] = cached
+    return cached
+
+
+def compact_cont_to_model_params_body(body_pose_cont):
+    num_3dof_angles = 69
+    num_1dof_angles = 58
+    num_1dof_trans = 6
     assert body_pose_cont.shape[-1] == (
         2 * num_3dof_angles + 2 * num_1dof_angles + num_1dof_trans
     )
+    body_inv_perm = _get_body_idx_cache(body_pose_cont.device)
     # Get subsets
     body_cont_3dofs = body_pose_cont[..., : 2 * num_3dof_angles]
     body_cont_1dofs = body_pose_cont[
@@ -346,11 +380,9 @@ def compact_cont_to_model_params_body(body_pose_cont):
     ## Nothing to do for trans
     body_params_trans = body_cont_trans
     # Put them together
-    body_pose_params = torch.zeros(*body_pose_cont.shape[:-1], 133).to(body_pose_cont)
-    body_pose_params[..., all_param_3dof_rot_idxs.flatten()] = body_params_3dofs
-    body_pose_params[..., all_param_1dof_rot_idxs] = body_params_1dofs
-    body_pose_params[..., all_param_1dof_trans_idxs] = body_params_trans
-    return body_pose_params
+    return torch.cat(
+        [body_params_3dofs, body_params_1dofs, body_params_trans], dim=-1
+    ).index_select(-1, body_inv_perm)
 
 
 def compact_model_params_to_cont_body(body_pose_params):

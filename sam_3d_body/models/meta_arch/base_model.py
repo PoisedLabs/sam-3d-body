@@ -38,14 +38,16 @@ class BaseModel(BaseLightningModule):
         crop_width: bool = False,
         is_full: bool = False,  # whether for full_branch
         crop_hand: int = 0,
+        is_normalized: bool = False,
     ) -> torch.Tensor:
         image_mean = self.image_mean if not is_full else self.full_image_mean
         image_std = self.image_std if not is_full else self.full_image_std
 
-        if inputs.max() > 1 and image_mean.max() <= 1.0:
-            inputs = inputs / 255.0
-        elif inputs.max() <= 1.0 and image_mean.max() > 1:
-            inputs = inputs * 255.0
+        if not is_normalized:
+            if inputs.max() > 1 and image_mean.max() <= 1.0:
+                inputs = inputs / 255.0
+            elif inputs.max() <= 1.0 and image_mean.max() > 1:
+                inputs = inputs * 255.0
         batch_inputs = (inputs - image_mean) / image_std
 
         if crop_width:
@@ -67,6 +69,7 @@ class BaseModel(BaseLightningModule):
         return batch_inputs
 
     def _initialize_batch(self, batch: Dict) -> None:
+        prev_bs = getattr(self, "_batch_size", None)
         # Check whether the input batch is with format
         # [batch_size, num_person, ...]
         if batch["img"].dim() == 5:
@@ -76,6 +79,13 @@ class BaseModel(BaseLightningModule):
             self._batch_size = batch["img"].shape[0]
             self._max_num_person = 0
             self._person_valid = None
+        if (
+            prev_bs is not None
+            and prev_bs != self._batch_size
+            and batch["img"].device.type == "mps"
+            and hasattr(torch, "mps")
+        ):
+            torch.mps.empty_cache()
 
     def _flatten_person(self, x: torch.Tensor) -> torch.Tensor:
         assert self._max_num_person is not None, "No max_num_person initialized"
