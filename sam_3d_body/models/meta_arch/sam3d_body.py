@@ -156,16 +156,6 @@ class SAM3DBody(BaseModel):
         )
         self.hand_pe_layer = PositionEmbeddingRandom(self.backbone.embed_dims // 2)
 
-        # Manually convert the torso of the model to fp16.
-        if self.cfg.TRAIN.USE_FP16:
-            self.convert_to_fp16()
-            if self.cfg.TRAIN.get("FP16_TYPE", "float16") == "float16":
-                self.backbone_dtype = torch.float16
-            else:
-                self.backbone_dtype = torch.bfloat16
-        else:
-            self.backbone_dtype = torch.float32
-
         self.ray_cond_emb = CameraEncoder(
             self.backbone.embed_dim,
             self.backbone.patch_size,
@@ -241,6 +231,16 @@ class SAM3DBody(BaseModel):
             num_fcs=2,
             add_identity=False,
         )
+
+        # Manually convert the torso of the model to fp16.
+        if self.cfg.TRAIN.USE_FP16:
+            self.convert_to_fp16()
+            if self.cfg.TRAIN.get("FP16_TYPE", "float16") == "float16":
+                self.backbone_dtype = torch.float16
+            else:
+                self.backbone_dtype = torch.bfloat16
+        else:
+            self.backbone_dtype = torch.float32
 
     def _get_decoder_condition(self, batch: Dict) -> Optional[torch.Tensor]:
         num_person = batch["img"].shape[1]
@@ -460,6 +460,8 @@ class SAM3DBody(BaseModel):
                     dim=1,
                 )  # B x 3 + 70 + 70 x 1024
 
+        num_decoder_layers = len(self.decoder.layers)
+
         # We're doing intermediate model predictions
         def token_to_pose_output_fn(tokens, prev_pose_output, layer_idx):
             # Get the pose token
@@ -469,18 +471,31 @@ class SAM3DBody(BaseModel):
             prev_camera = init_camera.view(batch_size, -1)
 
             # Get pose outputs
-            pose_output = self.head_pose(pose_token, prev_pose)
+            is_intermediate = (not self.training) and (
+                layer_idx < num_decoder_layers - 1
+            )
+            pose_output = self.head_pose(
+                pose_token, prev_pose, slim_keypoints=is_intermediate
+            )
             # Get Camera Translation
             if hasattr(self, "head_camera"):
-                pred_cam = self.head_camera(pose_token, prev_camera)
+                pred_cam = self.head_camera(pose_token, prev_camera).float()
                 pose_output["pred_cam"] = pred_cam
-            # Run camera projection
-            pose_output = self.camera_project(pose_output, batch)
+            # Run camera projection in float32
+            with torch.amp.autocast(
+                device_type=(
+                    pose_token.device.type
+                    if pose_token.device.type in ("cuda", "mps")
+                    else "cpu"
+                ),
+                enabled=False,
+            ):
+                pose_output = self.camera_project(pose_output, batch)
 
-            # Get 2D KPS in crop
-            pose_output["pred_keypoints_2d_cropped"] = self._full_to_crop(
-                batch, pose_output["pred_keypoints_2d"], self.body_batch_idx
-            )
+                # Get 2D KPS in crop
+                pose_output["pred_keypoints_2d_cropped"] = self._full_to_crop(
+                    batch, pose_output["pred_keypoints_2d"], self.body_batch_idx
+                )
 
             return pose_output
 
@@ -692,6 +707,8 @@ class SAM3DBody(BaseModel):
                     dim=1,
                 )  # B x 3 + 70 + 70 x 1024
 
+        num_decoder_hand_layers = len(self.decoder_hand.layers)
+
         # We're doing intermediate model predictions
         def token_to_pose_output_fn(tokens, prev_pose_output, layer_idx):
             # Get the pose token
@@ -701,19 +718,32 @@ class SAM3DBody(BaseModel):
             prev_camera = init_camera.view(batch_size, -1)
 
             # Get pose outputs
-            pose_output = self.head_pose_hand(pose_token, prev_pose)
+            is_intermediate = (not self.training) and (
+                layer_idx < num_decoder_hand_layers - 1
+            )
+            pose_output = self.head_pose_hand(
+                pose_token, prev_pose, slim_keypoints=is_intermediate
+            )
 
             # Get Camera Translation
             if hasattr(self, "head_camera_hand"):
-                pred_cam = self.head_camera_hand(pose_token, prev_camera)
+                pred_cam = self.head_camera_hand(pose_token, prev_camera).float()
                 pose_output["pred_cam"] = pred_cam
-            # Run camera projection
-            pose_output = self.camera_project_hand(pose_output, batch)
+            # Run camera projection in float32
+            with torch.amp.autocast(
+                device_type=(
+                    pose_token.device.type
+                    if pose_token.device.type in ("cuda", "mps")
+                    else "cpu"
+                ),
+                enabled=False,
+            ):
+                pose_output = self.camera_project_hand(pose_output, batch)
 
-            # Get 2D KPS in crop
-            pose_output["pred_keypoints_2d_cropped"] = self._full_to_crop(
-                batch, pose_output["pred_keypoints_2d"], self.hand_batch_idx
-            )
+                # Get 2D KPS in crop
+                pose_output["pred_keypoints_2d_cropped"] = self._full_to_crop(
+                    batch, pose_output["pred_keypoints_2d"], self.hand_batch_idx
+                )
 
             return pose_output
 
@@ -1026,13 +1056,24 @@ class SAM3DBody(BaseModel):
 
     def get_ray_condition(self, batch):
         B, N, _, H, W = batch["img"].shape
-        meshgrid_xy = (
-            torch.stack(
-                torch.meshgrid(torch.arange(H), torch.arange(W), indexing="xy"), dim=2
+        dev = batch["img"].device
+        dtype = batch["img"].dtype
+        cache = getattr(self, "_ray_meshgrid_cache", None)
+        if cache is None:
+            cache = {}
+            self._ray_meshgrid_cache = cache
+        key = (H, W, dev, dtype)
+        meshgrid_xy = cache.get(key)
+        if meshgrid_xy is None:
+            meshgrid_xy = torch.stack(
+                torch.meshgrid(
+                    torch.arange(H, device=dev, dtype=dtype),
+                    torch.arange(W, device=dev, dtype=dtype),
+                    indexing="xy",
+                ),
+                dim=2,
             )[None, None, :, :, :]
-            .repeat(B, N, 1, 1, 1)
-            .to(batch["img"].device)
-        )  # B x N x H x W x 2
+            cache[key] = meshgrid_xy
         meshgrid_xy = (
             meshgrid_xy / batch["affine_trans"][:, :, None, None, [0, 1], [0, 1]]
         )
@@ -1190,7 +1231,19 @@ class SAM3DBody(BaseModel):
             ValueError("Invalid decoder type: ", decoder_type)
 
         # Crop-image (pose) branch
-        pose_output = self.forward_pose_branch(batch)
+        dev_type = batch["img"].device.type
+        amp_dtype = getattr(self, "backbone_dtype", torch.bfloat16)
+        use_amp = (
+            bool(self.cfg.TRAIN.USE_FP16)
+            and dev_type in ("cuda", "mps")
+            and amp_dtype in (torch.float16, torch.bfloat16)
+        )
+        with torch.amp.autocast(
+            device_type=dev_type if dev_type in ("cuda", "mps") else "cpu",
+            dtype=amp_dtype if use_amp else torch.bfloat16,
+            enabled=use_amp,
+        ):
+            pose_output = self.forward_pose_branch(batch)
 
         return pose_output
 
