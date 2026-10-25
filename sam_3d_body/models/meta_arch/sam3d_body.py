@@ -793,7 +793,23 @@ class SAM3DBody(BaseModel):
         )
         return keypoint_prompt
 
+    def _slice_batch(self, tensor: torch.Tensor, batch_idx) -> torch.Tensor:
+        if batch_idx is None:
+            return tensor
+        if isinstance(batch_idx, slice):
+            return tensor[batch_idx]
+        if isinstance(batch_idx, (list, tuple)) and len(batch_idx) == tensor.shape[0]:
+            return tensor
+        return tensor[batch_idx]
+
     def _get_mask_prompt(self, batch, image_embeddings):
+        if not batch.get("has_mask", True):
+            B, _, H, W = image_embeddings.shape
+            return (
+                self.prompt_encoder.no_mask_embed.weight.reshape(1, -1, 1, 1)
+                .expand(B, -1, H, W)
+                .to(image_embeddings)
+            )
         x_mask = self._flatten_person(batch["mask"])
         mask_embeddings, no_mask_embeddings = self.prompt_encoder.get_mask_embeddings(
             x_mask, image_embeddings.shape[0], image_embeddings.shape[2:]
@@ -929,16 +945,12 @@ class SAM3DBody(BaseModel):
         pred_keypoints_2d_cropped = torch.cat(
             [pred_keypoints_2d, torch.ones_like(pred_keypoints_2d[:, :, [-1]])], dim=-1
         )
-        if batch_idx is not None:
-            affine_trans = self._flatten_person(batch["affine_trans"])[batch_idx].to(
-                pred_keypoints_2d_cropped
-            )
-            img_size = self._flatten_person(batch["img_size"])[batch_idx].unsqueeze(1)
-        else:
-            affine_trans = self._flatten_person(batch["affine_trans"]).to(
-                pred_keypoints_2d_cropped
-            )
-            img_size = self._flatten_person(batch["img_size"]).unsqueeze(1)
+        affine_trans = self._slice_batch(
+            self._flatten_person(batch["affine_trans"]), batch_idx
+        ).to(pred_keypoints_2d_cropped)
+        img_size = self._slice_batch(
+            self._flatten_person(batch["img_size"]), batch_idx
+        ).unsqueeze(1)
         pred_keypoints_2d_cropped = pred_keypoints_2d_cropped @ affine_trans.mT
         pred_keypoints_2d_cropped = pred_keypoints_2d_cropped[..., :2] / img_size - 0.5
 
@@ -959,37 +971,50 @@ class SAM3DBody(BaseModel):
         else:
             assert False
 
+        bbox_center = self._slice_batch(
+            self._flatten_person(batch["bbox_center"]), self.body_batch_idx
+        )
+        bbox_scale = self._slice_batch(
+            self._flatten_person(batch["bbox_scale"]), self.body_batch_idx
+        )[:, 0]
+        ori_img_size = self._slice_batch(
+            self._flatten_person(batch["ori_img_size"]), self.body_batch_idx
+        )
+        num_person = batch["img"].shape[1]
+        cam_int_flat = (
+            batch["cam_int"]
+            if num_person == 1
+            else self._flatten_person(
+                batch["cam_int"]
+                .unsqueeze(1)
+                .expand(-1, num_person, -1, -1)
+                .contiguous()
+            )
+        )
+        cam_int = self._slice_batch(cam_int_flat, self.body_batch_idx)
+        use_intrin_center = self.cfg.MODEL.DECODER.get("USE_INTRIN_CENTER", False)
+
         cam_out = head_camera.perspective_projection(
             pose_output["pred_keypoints_3d"],
             pred_cam,
-            self._flatten_person(batch["bbox_center"])[self.body_batch_idx],
-            self._flatten_person(batch["bbox_scale"])[self.body_batch_idx, 0],
-            self._flatten_person(batch["ori_img_size"])[self.body_batch_idx],
-            self._flatten_person(
-                batch["cam_int"]
-                .unsqueeze(1)
-                .expand(-1, batch["img"].shape[1], -1, -1)
-                .contiguous()
-            )[self.body_batch_idx],
-            use_intrin_center=self.cfg.MODEL.DECODER.get("USE_INTRIN_CENTER", False),
+            bbox_center,
+            bbox_scale,
+            ori_img_size,
+            cam_int,
+            use_intrin_center=use_intrin_center,
         )
 
-        if pose_output.get("pred_vertices", None) is not None:
+        if pose_output.get("pred_vertices", None) is not None and (
+            self.training or batch.get("project_vertices_2d", False)
+        ):
             cam_out_vertices = head_camera.perspective_projection(
                 pose_output["pred_vertices"],
                 pred_cam,
-                self._flatten_person(batch["bbox_center"])[self.body_batch_idx],
-                self._flatten_person(batch["bbox_scale"])[self.body_batch_idx, 0],
-                self._flatten_person(batch["ori_img_size"])[self.body_batch_idx],
-                self._flatten_person(
-                    batch["cam_int"]
-                    .unsqueeze(1)
-                    .expand(-1, batch["img"].shape[1], -1, -1)
-                    .contiguous()
-                )[self.body_batch_idx],
-                use_intrin_center=self.cfg.MODEL.DECODER.get(
-                    "USE_INTRIN_CENTER", False
-                ),
+                bbox_center,
+                bbox_scale,
+                ori_img_size,
+                cam_int,
+                use_intrin_center=use_intrin_center,
             )
             pose_output["pred_keypoints_2d_verts"] = cam_out_vertices[
                 "pred_keypoints_2d"
@@ -1014,37 +1039,50 @@ class SAM3DBody(BaseModel):
         else:
             assert False
 
+        bbox_center = self._slice_batch(
+            self._flatten_person(batch["bbox_center"]), self.hand_batch_idx
+        )
+        bbox_scale = self._slice_batch(
+            self._flatten_person(batch["bbox_scale"]), self.hand_batch_idx
+        )[:, 0]
+        ori_img_size = self._slice_batch(
+            self._flatten_person(batch["ori_img_size"]), self.hand_batch_idx
+        )
+        num_person = batch["img"].shape[1]
+        cam_int_flat = (
+            batch["cam_int"]
+            if num_person == 1
+            else self._flatten_person(
+                batch["cam_int"]
+                .unsqueeze(1)
+                .expand(-1, num_person, -1, -1)
+                .contiguous()
+            )
+        )
+        cam_int = self._slice_batch(cam_int_flat, self.hand_batch_idx)
+        use_intrin_center = self.cfg.MODEL.DECODER.get("USE_INTRIN_CENTER", False)
+
         cam_out = head_camera.perspective_projection(
             pose_output["pred_keypoints_3d"],
             pred_cam,
-            self._flatten_person(batch["bbox_center"])[self.hand_batch_idx],
-            self._flatten_person(batch["bbox_scale"])[self.hand_batch_idx, 0],
-            self._flatten_person(batch["ori_img_size"])[self.hand_batch_idx],
-            self._flatten_person(
-                batch["cam_int"]
-                .unsqueeze(1)
-                .expand(-1, batch["img"].shape[1], -1, -1)
-                .contiguous()
-            )[self.hand_batch_idx],
-            use_intrin_center=self.cfg.MODEL.DECODER.get("USE_INTRIN_CENTER", False),
+            bbox_center,
+            bbox_scale,
+            ori_img_size,
+            cam_int,
+            use_intrin_center=use_intrin_center,
         )
 
-        if pose_output.get("pred_vertices", None) is not None:
+        if pose_output.get("pred_vertices", None) is not None and (
+            self.training or batch.get("project_vertices_2d", False)
+        ):
             cam_out_vertices = head_camera.perspective_projection(
                 pose_output["pred_vertices"],
                 pred_cam,
-                self._flatten_person(batch["bbox_center"])[self.hand_batch_idx],
-                self._flatten_person(batch["bbox_scale"])[self.hand_batch_idx, 0],
-                self._flatten_person(batch["ori_img_size"])[self.hand_batch_idx],
-                self._flatten_person(
-                    batch["cam_int"]
-                    .unsqueeze(1)
-                    .expand(-1, batch["img"].shape[1], -1, -1)
-                    .contiguous()
-                )[self.hand_batch_idx],
-                use_intrin_center=self.cfg.MODEL.DECODER.get(
-                    "USE_INTRIN_CENTER", False
-                ),
+                bbox_center,
+                bbox_scale,
+                ori_img_size,
+                cam_int,
+                use_intrin_center=use_intrin_center,
             )
             pose_output["pred_keypoints_2d_verts"] = cam_out_vertices[
                 "pred_keypoints_2d"
@@ -1112,6 +1150,7 @@ class SAM3DBody(BaseModel):
                     "vit_hmr_512_384",
                 ]
             ),
+            is_normalized=bool(batch.get("is_normalized", False)),
         )
 
         # Optionally get ray conditioining
@@ -1130,89 +1169,120 @@ class SAM3DBody(BaseModel):
             ray_cond = ray_cond[:, :, :, 64:-64]
 
         if len(self.body_batch_idx):
-            batch["ray_cond"] = ray_cond[self.body_batch_idx].clone()
+            batch["ray_cond"] = self._slice_batch(ray_cond, self.body_batch_idx)
         if len(self.hand_batch_idx):
-            batch["ray_cond_hand"] = ray_cond[self.hand_batch_idx].clone()
+            batch["ray_cond_hand"] = self._slice_batch(ray_cond, self.hand_batch_idx)
         ray_cond = None
 
-        image_embeddings = self.backbone(
-            x.type(self.backbone_dtype), extra_embed=ray_cond
-        )  # (B, C, H, W)
+        dev_type = x.device.type
+        amp_dtype = getattr(self, "backbone_dtype", torch.bfloat16)
+        use_amp = (
+            bool(self.cfg.TRAIN.USE_FP16)
+            and dev_type in ("cuda", "mps")
+            and amp_dtype in (torch.float16, torch.bfloat16)
+        )
+        # Backbone weights are already converted to self.backbone_dtype by convert_to_fp16();
+        # running backbone with autocast disabled avoids 64 LayerNorm bfloat16->float32->bfloat16
+        # round-trip casts across the 32 DINOv3 blocks on MPS.
+        with torch.amp.autocast(
+            device_type=dev_type if dev_type in ("cuda", "mps") else "cpu",
+            enabled=False,
+        ):
+            image_embeddings = self.backbone(
+                x.type(self.backbone_dtype), extra_embed=ray_cond
+            )  # (B, C, H, W)
 
         if isinstance(image_embeddings, tuple):
             image_embeddings = image_embeddings[-1]
         image_embeddings = image_embeddings.type(x.dtype)
 
-        # Mask condition if available
-        if self.cfg.MODEL.PROMPT_ENCODER.get("MASK_EMBED_TYPE", None) is not None:
-            # v1: non-iterative mask conditioning
-            if self.cfg.MODEL.PROMPT_ENCODER.get("MASK_PROMPT", "v1") == "v1":
-                mask_embeddings = self._get_mask_prompt(batch, image_embeddings)
-                image_embeddings = image_embeddings + mask_embeddings
-            else:
-                raise NotImplementedError
+        with torch.amp.autocast(
+            device_type=dev_type if dev_type in ("cuda", "mps") else "cpu",
+            dtype=amp_dtype if use_amp else torch.bfloat16,
+            enabled=use_amp,
+        ):
+            # Mask condition if available
+            if self.cfg.MODEL.PROMPT_ENCODER.get("MASK_EMBED_TYPE", None) is not None:
+                # v1: non-iterative mask conditioning
+                if self.cfg.MODEL.PROMPT_ENCODER.get("MASK_PROMPT", "v1") == "v1":
+                    mask_embeddings = self._get_mask_prompt(batch, image_embeddings)
+                    image_embeddings = image_embeddings + mask_embeddings
+                else:
+                    raise NotImplementedError
 
-        # Prepare input for promptable decoder
-        condition_info = self._get_decoder_condition(batch)
+            # Prepare input for promptable decoder
+            condition_info = self._get_decoder_condition(batch)
 
-        # Initial estimate with a dummy prompt
-        keypoints_prompt = torch.zeros((batch_size * num_person, 1, 3)).to(batch["img"])
-        keypoints_prompt[:, :, -1] = -2
-
-        # Forward promptable decoder to get updated pose tokens and regression output
-        pose_output, pose_output_hand = None, None
-        if len(self.body_batch_idx):
-            tokens_output, pose_output = self.forward_decoder(
-                image_embeddings[self.body_batch_idx],
-                init_estimate=None,
-                keypoints=keypoints_prompt[self.body_batch_idx],
-                prev_estimate=None,
-                condition_info=condition_info[self.body_batch_idx],
-                batch=batch,
+            # Initial estimate with a dummy prompt
+            keypoints_prompt = torch.zeros(
+                (batch_size * num_person, 1, 3),
+                device=batch["img"].device,
+                dtype=batch["img"].dtype,
             )
-            pose_output = pose_output[-1]
-        if len(self.hand_batch_idx):
-            tokens_output_hand, pose_output_hand = self.forward_decoder_hand(
-                image_embeddings[self.hand_batch_idx],
-                init_estimate=None,
-                keypoints=keypoints_prompt[self.hand_batch_idx],
-                prev_estimate=None,
-                condition_info=condition_info[self.hand_batch_idx],
-                batch=batch,
-            )
-            pose_output_hand = pose_output_hand[-1]
+            keypoints_prompt[:, :, -1] = -2
 
-        output = {
-            # "pose_token": pose_token,
-            "mhr": pose_output,  # mhr prediction output
-            "mhr_hand": pose_output_hand,  # mhr prediction output
-            "condition_info": condition_info,
-            "image_embeddings": image_embeddings,
-        }
-
-        if self.cfg.MODEL.DECODER.get("DO_HAND_DETECT_TOKENS", False):
+            # Forward promptable decoder to get updated pose tokens and regression output
+            pose_output, pose_output_hand = None, None
             if len(self.body_batch_idx):
-                output_hand_box_tokens = tokens_output
-                hand_coords = self.bbox_embed(
-                    output_hand_box_tokens
-                ).sigmoid()  # x1, y1, w, h for body samples, 0 ~ 1
-                hand_logits = self.hand_cls_embed(output_hand_box_tokens)
-
-                output["mhr"]["hand_box"] = hand_coords
-                output["mhr"]["hand_logits"] = hand_logits
-
-            if len(self.hand_batch_idx):
-                output_hand_box_tokens_hand_batch = tokens_output_hand
-
-                hand_coords_hand_batch = self.bbox_embed(
-                    output_hand_box_tokens_hand_batch
-                ).sigmoid()  # x1, y1, w, h for hand samples
-                hand_logits_hand_batch = self.hand_cls_embed(
-                    output_hand_box_tokens_hand_batch
+                tokens_output, pose_output = self.forward_decoder(
+                    self._slice_batch(image_embeddings, self.body_batch_idx),
+                    init_estimate=None,
+                    keypoints=self._slice_batch(keypoints_prompt, self.body_batch_idx),
+                    prev_estimate=None,
+                    condition_info=(
+                        self._slice_batch(condition_info, self.body_batch_idx)
+                        if condition_info is not None
+                        else None
+                    ),
+                    batch=batch,
                 )
+                pose_output = pose_output[-1]
+            if len(self.hand_batch_idx):
+                tokens_output_hand, pose_output_hand = self.forward_decoder_hand(
+                    self._slice_batch(image_embeddings, self.hand_batch_idx),
+                    init_estimate=None,
+                    keypoints=self._slice_batch(keypoints_prompt, self.hand_batch_idx),
+                    prev_estimate=None,
+                    condition_info=(
+                        self._slice_batch(condition_info, self.hand_batch_idx)
+                        if condition_info is not None
+                        else None
+                    ),
+                    batch=batch,
+                )
+                pose_output_hand = pose_output_hand[-1]
 
-                output["mhr_hand"]["hand_box"] = hand_coords_hand_batch
-                output["mhr_hand"]["hand_logits"] = hand_logits_hand_batch
+            output = {
+                # "pose_token": pose_token,
+                "mhr": pose_output,  # mhr prediction output
+                "mhr_hand": pose_output_hand,  # mhr prediction output
+                "condition_info": condition_info,
+                "image_embeddings": image_embeddings,
+            }
+
+            if self.cfg.MODEL.DECODER.get("DO_HAND_DETECT_TOKENS", False):
+                if len(self.body_batch_idx):
+                    output_hand_box_tokens = tokens_output
+                    hand_coords = self.bbox_embed(
+                        output_hand_box_tokens
+                    ).sigmoid()  # x1, y1, w, h for body samples, 0 ~ 1
+                    hand_logits = self.hand_cls_embed(output_hand_box_tokens)
+
+                    output["mhr"]["hand_box"] = hand_coords
+                    output["mhr"]["hand_logits"] = hand_logits
+
+                if len(self.hand_batch_idx):
+                    output_hand_box_tokens_hand_batch = tokens_output_hand
+
+                    hand_coords_hand_batch = self.bbox_embed(
+                        output_hand_box_tokens_hand_batch
+                    ).sigmoid()  # x1, y1, w, h for hand samples
+                    hand_logits_hand_batch = self.hand_cls_embed(
+                        output_hand_box_tokens_hand_batch
+                    )
+
+                    output["mhr_hand"]["hand_box"] = hand_coords_hand_batch
+                    output["mhr_hand"]["hand_logits"] = hand_logits_hand_batch
 
         return output
 
@@ -1231,19 +1301,7 @@ class SAM3DBody(BaseModel):
             ValueError("Invalid decoder type: ", decoder_type)
 
         # Crop-image (pose) branch
-        dev_type = batch["img"].device.type
-        amp_dtype = getattr(self, "backbone_dtype", torch.bfloat16)
-        use_amp = (
-            bool(self.cfg.TRAIN.USE_FP16)
-            and dev_type in ("cuda", "mps")
-            and amp_dtype in (torch.float16, torch.bfloat16)
-        )
-        with torch.amp.autocast(
-            device_type=dev_type if dev_type in ("cuda", "mps") else "cpu",
-            dtype=amp_dtype if use_amp else torch.bfloat16,
-            enabled=use_amp,
-        ):
-            pose_output = self.forward_pose_branch(batch)
+        pose_output = self.forward_pose_branch(batch)
 
         return pose_output
 
@@ -1755,22 +1813,13 @@ class SAM3DBody(BaseModel):
         )
 
         # Crop to full. batch["affine_trans"] is full-to-crop, right application
-        batch["left_scale"] = (
-            batch["left_scale"]
-            / batch["affine_trans"][0, :, 0, 0].cpu().numpy()[:, None]
-        )
-        batch["right_scale"] = (
-            batch["right_scale"]
-            / batch["affine_trans"][0, :, 0, 0].cpu().numpy()[:, None]
-        )
-        batch["left_center"] = (
-            batch["left_center"]
-            - batch["affine_trans"][0, :, [0, 1], [2, 2]].cpu().numpy()
-        ) / batch["affine_trans"][0, :, 0, 0].cpu().numpy()[:, None]
-        batch["right_center"] = (
-            batch["right_center"]
-            - batch["affine_trans"][0, :, [0, 1], [2, 2]].cpu().numpy()
-        ) / batch["affine_trans"][0, :, 0, 0].cpu().numpy()[:, None]
+        affine_flat = self._flatten_person(batch["affine_trans"]).detach().cpu().numpy()
+        affine_scale = affine_flat[:, 0, 0][:, None]
+        affine_offset = affine_flat[:, [0, 1], [2, 2]]
+        batch["left_scale"] = batch["left_scale"] / affine_scale
+        batch["right_scale"] = batch["right_scale"] / affine_scale
+        batch["left_center"] = (batch["left_center"] - affine_offset) / affine_scale
+        batch["right_center"] = (batch["right_center"] - affine_offset) / affine_scale
 
         left_xyxy = np.concatenate(
             [
@@ -1829,17 +1878,16 @@ class SAM3DBody(BaseModel):
         num_keypoints = self.keypoint_embedding.weight.shape[0]
 
         # Get current 2D KPS predictions
-        pred_keypoints_2d_cropped = pose_output[
-            "pred_keypoints_2d_cropped"
-        ].clone()  # These are -0.5 ~ 0.5
-        pred_keypoints_2d_depth = pose_output["pred_keypoints_2d_depth"].clone()
+        pred_keypoints_2d_cropped = pose_output["pred_keypoints_2d_cropped"]
+        pred_keypoints_2d_depth = pose_output["pred_keypoints_2d_depth"]
 
-        pred_keypoints_2d_cropped = pred_keypoints_2d_cropped[
-            :, self.keypoint_embedding_idxs
-        ]
-        pred_keypoints_2d_depth = pred_keypoints_2d_depth[
-            :, self.keypoint_embedding_idxs
-        ]
+        if pred_keypoints_2d_cropped.shape[1] != num_keypoints:
+            pred_keypoints_2d_cropped = pred_keypoints_2d_cropped[
+                :, self.keypoint_embedding_idxs
+            ]
+            pred_keypoints_2d_depth = pred_keypoints_2d_depth[
+                :, self.keypoint_embedding_idxs
+            ]
 
         # Get 2D KPS to be 0 ~ 1
         pred_keypoints_2d_cropped_01 = pred_keypoints_2d_cropped + 0.5
@@ -1852,11 +1900,11 @@ class SAM3DBody(BaseModel):
             | (pred_keypoints_2d_cropped_01[:, :, 1] > 1)
             | (pred_keypoints_2d_depth[:, :] < 1e-5)
         )
+        valid_mask = (~invalid_mask[:, :, None]).to(token_augment.dtype)
 
         # Run them through the prompt encoder's pos emb function
         token_augment[:, kps_emb_start_idx : kps_emb_start_idx + num_keypoints, :] = (
-            self.keypoint_posemb_linear(pred_keypoints_2d_cropped)
-            * (~invalid_mask[:, :, None])
+            self.keypoint_posemb_linear(pred_keypoints_2d_cropped) * valid_mask
         )
 
         # Also maybe update token_embeddings with the grid sampled 2D feature.
@@ -1873,6 +1921,9 @@ class SAM3DBody(BaseModel):
         ]:
             # Need to go from 256 x 256 coords to 256 x 192 (HW) because image_embeddings is 16x12
             # Aka, for x, what was normally -1 ~ 1 for 256 should be -16/12 ~ 16/12 (since to sample at original 256, need to overflow)
+            pred_keypoints_2d_cropped_sample_points = (
+                pred_keypoints_2d_cropped_sample_points.clone()
+            )
             pred_keypoints_2d_cropped_sample_points[:, :, 0] = (
                 pred_keypoints_2d_cropped_sample_points[:, :, 0] / 12 * 16
             )
@@ -1890,11 +1941,8 @@ class SAM3DBody(BaseModel):
             .permute(0, 2, 1)
         )  # B x kps x C
         # Zero out invalid locations...
-        pred_keypoints_2d_cropped_feats = pred_keypoints_2d_cropped_feats * (
-            ~invalid_mask[:, :, None]
-        )
+        pred_keypoints_2d_cropped_feats = pred_keypoints_2d_cropped_feats * valid_mask
         # This is ADDING
-        token_embeddings = token_embeddings.clone()
         token_embeddings[
             :,
             kps_emb_start_idx : kps_emb_start_idx + num_keypoints,
@@ -1918,23 +1966,20 @@ class SAM3DBody(BaseModel):
         num_keypoints3d = self.keypoint3d_embedding.weight.shape[0]
 
         # Get current 3D kps predictions
-        pred_keypoints_3d = pose_output["pred_keypoints_3d"].clone()
+        pred_keypoints_3d = pose_output["pred_keypoints_3d"]
 
         # Now, pelvis normalize
-        pred_keypoints_3d = (
-            pred_keypoints_3d
-            - (
-                pred_keypoints_3d[:, [self.pelvis_idx[0]], :]
-                + pred_keypoints_3d[:, [self.pelvis_idx[1]], :]
-            )
-            / 2
-        )
+        pelvis = (
+            pred_keypoints_3d[:, self.pelvis_idx[0] : self.pelvis_idx[0] + 1, :]
+            + pred_keypoints_3d[:, self.pelvis_idx[1] : self.pelvis_idx[1] + 1, :]
+        ) * 0.5
+        pred_keypoints_3d = pred_keypoints_3d - pelvis
 
         # Get the kps we care about, _after_ pelvis norm (just in case idxs shift)
-        pred_keypoints_3d = pred_keypoints_3d[:, self.keypoint3d_embedding_idxs]
+        if pred_keypoints_3d.shape[1] != num_keypoints3d:
+            pred_keypoints_3d = pred_keypoints_3d[:, self.keypoint3d_embedding_idxs]
 
         # Run through embedding MLP & put in
-        token_augment = token_augment.clone()
         token_augment[
             :,
             kps3d_emb_start_idx : kps3d_emb_start_idx + num_keypoints3d,
@@ -1963,17 +2008,16 @@ class SAM3DBody(BaseModel):
         num_keypoints = self.keypoint_embedding_hand.weight.shape[0]
 
         # Get current 2D KPS predictions
-        pred_keypoints_2d_cropped = pose_output[
-            "pred_keypoints_2d_cropped"
-        ].clone()  # These are -0.5 ~ 0.5
-        pred_keypoints_2d_depth = pose_output["pred_keypoints_2d_depth"].clone()
+        pred_keypoints_2d_cropped = pose_output["pred_keypoints_2d_cropped"]
+        pred_keypoints_2d_depth = pose_output["pred_keypoints_2d_depth"]
 
-        pred_keypoints_2d_cropped = pred_keypoints_2d_cropped[
-            :, self.keypoint_embedding_idxs_hand
-        ]
-        pred_keypoints_2d_depth = pred_keypoints_2d_depth[
-            :, self.keypoint_embedding_idxs_hand
-        ]
+        if pred_keypoints_2d_cropped.shape[1] != num_keypoints:
+            pred_keypoints_2d_cropped = pred_keypoints_2d_cropped[
+                :, self.keypoint_embedding_idxs_hand
+            ]
+            pred_keypoints_2d_depth = pred_keypoints_2d_depth[
+                :, self.keypoint_embedding_idxs_hand
+            ]
 
         # Get 2D KPS to be 0 ~ 1
         pred_keypoints_2d_cropped_01 = pred_keypoints_2d_cropped + 0.5
@@ -1986,11 +2030,11 @@ class SAM3DBody(BaseModel):
             | (pred_keypoints_2d_cropped_01[:, :, 1] > 1)
             | (pred_keypoints_2d_depth[:, :] < 1e-5)
         )
+        valid_mask = (~invalid_mask[:, :, None]).to(token_augment.dtype)
 
         # Run them through the prompt encoder's pos emb function
         token_augment[:, kps_emb_start_idx : kps_emb_start_idx + num_keypoints, :] = (
-            self.keypoint_posemb_linear_hand(pred_keypoints_2d_cropped)
-            * (~invalid_mask[:, :, None])
+            self.keypoint_posemb_linear_hand(pred_keypoints_2d_cropped) * valid_mask
         )
 
         # Also maybe update token_embeddings with the grid sampled 2D feature.
@@ -2007,6 +2051,9 @@ class SAM3DBody(BaseModel):
         ]:
             # Need to go from 256 x 256 coords to 256 x 192 (HW) because image_embeddings is 16x12
             # Aka, for x, what was normally -1 ~ 1 for 256 should be -16/12 ~ 16/12 (since to sample at original 256, need to overflow)
+            pred_keypoints_2d_cropped_sample_points = (
+                pred_keypoints_2d_cropped_sample_points.clone()
+            )
             pred_keypoints_2d_cropped_sample_points[:, :, 0] = (
                 pred_keypoints_2d_cropped_sample_points[:, :, 0] / 12 * 16
             )
@@ -2024,11 +2071,8 @@ class SAM3DBody(BaseModel):
             .permute(0, 2, 1)
         )  # B x kps x C
         # Zero out invalid locations...
-        pred_keypoints_2d_cropped_feats = pred_keypoints_2d_cropped_feats * (
-            ~invalid_mask[:, :, None]
-        )
+        pred_keypoints_2d_cropped_feats = pred_keypoints_2d_cropped_feats * valid_mask
         # This is ADDING
-        token_embeddings = token_embeddings.clone()
         token_embeddings[
             :,
             kps_emb_start_idx : kps_emb_start_idx + num_keypoints,
@@ -2052,23 +2096,20 @@ class SAM3DBody(BaseModel):
         num_keypoints3d = self.keypoint3d_embedding_hand.weight.shape[0]
 
         # Get current 3D kps predictions
-        pred_keypoints_3d = pose_output["pred_keypoints_3d"].clone()
+        pred_keypoints_3d = pose_output["pred_keypoints_3d"]
 
         # Now, pelvis normalize
-        pred_keypoints_3d = (
-            pred_keypoints_3d
-            - (
-                pred_keypoints_3d[:, [self.pelvis_idx[0]], :]
-                + pred_keypoints_3d[:, [self.pelvis_idx[1]], :]
-            )
-            / 2
-        )
+        pelvis = (
+            pred_keypoints_3d[:, self.pelvis_idx[0] : self.pelvis_idx[0] + 1, :]
+            + pred_keypoints_3d[:, self.pelvis_idx[1] : self.pelvis_idx[1] + 1, :]
+        ) * 0.5
+        pred_keypoints_3d = pred_keypoints_3d - pelvis
 
         # Get the kps we care about, _after_ pelvis norm (just in case idxs shift)
-        pred_keypoints_3d = pred_keypoints_3d[:, self.keypoint3d_embedding_idxs_hand]
+        if pred_keypoints_3d.shape[1] != num_keypoints3d:
+            pred_keypoints_3d = pred_keypoints_3d[:, self.keypoint3d_embedding_idxs_hand]
 
         # Run through embedding MLP & put in
-        token_augment = token_augment.clone()
         token_augment[
             :,
             kps3d_emb_start_idx : kps3d_emb_start_idx + num_keypoints3d,

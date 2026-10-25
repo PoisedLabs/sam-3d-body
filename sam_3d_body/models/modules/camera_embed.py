@@ -78,26 +78,35 @@ class FourierPositionEncoding(nn.Module):
         return fourier_pos_enc
 
 
+_FREQ_BANDS_CACHE = {}
+
+
 def _generate_fourier_features(pos, num_bands, max_resolution):
     """Generate fourier features from a given set of positions and frequencies"""
     b, n = pos.shape[:2]
     device = pos.device
+    dtype = pos.dtype
 
-    # Linear frequency sampling
-    min_freq = 1.0
-    freq_bands = torch.stack(
-        [
-            torch.linspace(start=min_freq, end=res / 2, steps=num_bands, device=device)
-            for res in max_resolution
-        ],
-        dim=0,
-    )
+    key = (device, dtype, num_bands, tuple(max_resolution))
+    freq_bands = _FREQ_BANDS_CACHE.get(key)
+    if freq_bands is None:
+        min_freq = 1.0
+        freq_bands = torch.stack(
+            [
+                torch.linspace(
+                    start=min_freq,
+                    end=res / 2,
+                    steps=num_bands,
+                    device=device,
+                    dtype=dtype,
+                )
+                for res in max_resolution
+            ],
+            dim=0,
+        )
+        _FREQ_BANDS_CACHE[key] = freq_bands
 
-    # Stacking
-    per_pos_features = torch.stack(
-        [pos[i, :, :][:, :, None] * freq_bands[None, :, :] for i in range(b)], 0
-    )
-    per_pos_features = per_pos_features.reshape(b, n, -1)
+    per_pos_features = (pos.unsqueeze(-1) * freq_bands).reshape(b, n, -1)
 
     # Sin-Cos
     per_pos_features = torch.cat(

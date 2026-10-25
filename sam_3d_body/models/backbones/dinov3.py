@@ -61,6 +61,10 @@ class Dinov3Backbone(nn.Module):
         rope_embed.forward = cached_forward
 
         for blk in getattr(self.encoder, "blocks", []):
+            for ls_name in ("ls1", "ls2"):
+                ls_mod = getattr(blk, ls_name, None)
+                if ls_mod is not None and hasattr(ls_mod, "inplace"):
+                    ls_mod.inplace = True
             attn = getattr(blk, "attn", None)
             if attn is None:
                 continue

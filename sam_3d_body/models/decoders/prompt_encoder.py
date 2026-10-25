@@ -93,6 +93,8 @@ class PromptEncoder(nn.Module):
 
         self.frozen = frozen
         self._freeze_stages()
+        self._dense_pe_cache = {}
+        self._point_embed_table_cache = None
 
     def get_dense_pe(self, size: Tuple[int, int]) -> torch.Tensor:
         """
@@ -103,7 +105,35 @@ class PromptEncoder(nn.Module):
           torch.Tensor: Positional encoding with shape
             1x(embed_dim)x(embedding_h)x(embedding_w)
         """
+        if not self.training:
+            mat = self.pe_layer.positional_encoding_gaussian_matrix
+            key = (size, mat.device, mat.dtype)
+            cached = self._dense_pe_cache.get(key)
+            if cached is not None:
+                return cached
+            pe = self.pe_layer(size).unsqueeze(0)
+            self._dense_pe_cache[key] = pe
+            return pe
         return self.pe_layer(size).unsqueeze(0)
+
+    def _get_point_embed_table(self) -> torch.Tensor:
+        dev = self._get_device()
+        dtype = self.invalid_point_embed.weight.dtype
+        if (
+            not self.training
+            and self._point_embed_table_cache is not None
+            and self._point_embed_table_cache.device == dev
+            and self._point_embed_table_cache.dtype == dtype
+        ):
+            return self._point_embed_table_cache
+        table = torch.cat(
+            [self.invalid_point_embed.weight, self.not_a_point_embed.weight]
+            + [e.weight for e in self.point_embeddings],
+            dim=0,
+        )
+        if not self.training:
+            self._point_embed_table_cache = table
+        return table
 
     def _embed_keypoints(
         self,
@@ -116,15 +146,15 @@ class PromptEncoder(nn.Module):
 
         Output shape [B, N, C], mask shape [B, N]
         """
-        assert points.min() >= 0 and points.max() <= 1
         point_embedding = self.pe_layer._pe_encoding(points.to(torch.float))
-        point_embedding[labels == -2] = 0.0  # invalid points
-        point_embedding[labels == -2] += self.invalid_point_embed.weight
-        point_embedding[labels == -1] = 0.0
-        point_embedding[labels == -1] += self.not_a_point_embed.weight
-        for i in range(self.num_body_joints):
-            point_embedding[labels == i] += self.point_embeddings[i].weight
-
+        table = self._get_point_embed_table().to(dtype=point_embedding.dtype)
+        idx = (labels.long() + 2).clamp(0, self.num_body_joints + 1)
+        label_emb = torch.nn.functional.embedding(idx, table)
+        point_embedding = torch.where(
+            (labels < 0).unsqueeze(-1),
+            label_emb,
+            point_embedding + label_emb,
+        )
         point_mask = labels > -2
         return point_embedding, point_mask
 
