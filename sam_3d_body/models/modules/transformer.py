@@ -605,11 +605,12 @@ class TransformerDecoderLayer(nn.Module):
             context_pe = self.ln_pe_2(context_pe)
 
         # Self attention block for tokens
+        ln1_x = self.ln1(x)
         if self.repeat_pe and not self.skip_first_pe and x_pe is not None:
-            q = k = self.ln1(x) + x_pe
-            v = self.ln1(x)
+            q = k = ln1_x + x_pe
+            v = ln1_x
         else:
-            q = k = v = self.ln1(x)
+            q = k = v = ln1_x
 
         attn_mask = None
         if x_mask is not None:
@@ -620,13 +621,14 @@ class TransformerDecoderLayer(nn.Module):
         x = x + self.self_attn(q=q, k=k, v=v, attn_mask=attn_mask)
 
         # Cross attention block, tokens attending to image embedding
+        ln2_context = self.ln2_2(context)
         if self.repeat_pe and context_pe is not None:
             q = self.ln2_1(x) + x_pe
-            k = self.ln2_2(context) + context_pe
-            v = self.ln2_2(context)
+            k = ln2_context + context_pe
+            v = ln2_context
         else:
             q = self.ln2_1(x)
-            k = v = self.ln2_2(context)
+            k = v = ln2_context
         x = x + self.cross_attn(q=q, k=k, v=v)
 
         # MLP block

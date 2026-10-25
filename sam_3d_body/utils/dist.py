@@ -24,6 +24,8 @@ def recursive_to(x: Any, target: torch.device):
         return {k: recursive_to(v, target) for k, v in x.items()}
     elif isinstance(x, torch.Tensor):
         if target == "numpy":
+            if x.dtype == torch.bfloat16:
+                return x.float().numpy()
             return x.numpy()
         else:
             if x.dtype == torch.float64 and str(target).startswith("mps"):
